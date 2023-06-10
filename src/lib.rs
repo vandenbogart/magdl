@@ -4,8 +4,12 @@
 //!
 
 use std::{
+    borrow::BorrowMut,
+    collections::HashMap,
     net::{self, IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket},
-    time::Duration, collections::HashMap, sync::{Arc, MutexGuard, Mutex, mpsc}, thread, borrow::BorrowMut,
+    sync::{mpsc, Arc, Mutex, MutexGuard},
+    thread,
+    time::Duration, io::Write,
 };
 
 use anyhow::{bail, Context};
@@ -79,16 +83,17 @@ impl Magdl {
         let peer_thread = thread::spawn(move || {
             peer_addrs
                 .into_iter()
-                .for_each(|addr| {
-                    match PeerConnection::establish(addr) {
-                        Ok(conn) => {
-                            let key = SourceKey::Peer(conn.addr);
-                            p_sources.lock().unwrap().register(key.clone(), &conn.socket, interest::ALL);
-                            p_source_map.lock().unwrap().insert(key.clone(), conn);
-                        },
-                        Err(e) => println!("Failed to connect to peer {}", e)
-
+                .for_each(|addr| match PeerConnection::establish(addr) {
+                    Ok(conn) => {
+                        let key = SourceKey::Peer(conn.addr);
+                        p_sources.lock().unwrap().register(
+                            key.clone(),
+                            &conn.socket,
+                            interest::ALL,
+                        );
+                        p_source_map.lock().unwrap().insert(key.clone(), conn);
                     }
+                    Err(e) => println!("Failed to connect to peer {}", e),
                 })
         });
 
@@ -102,18 +107,22 @@ impl Magdl {
             for event in events.lock().unwrap().drain(..) {
                 let key = event.key;
                 let source = event.source;
-                let peer_conn = source_map.lock().unwrap().get(&key).expect("Registered source has no peer counterpart");
                 if source.is_error() || source.is_invalid() || source.is_hangup() {
                     sources.lock().unwrap().unregister(&key);
-                    dbg!("Disconnected or errored", key);
+                    dbg!("Disconnected or errored", &key);
                 }
-                if event.source.is_readable() {
-                    dbg!("Peer is readable");
 
+                let peer_conn = source_map
+                    .lock()
+                    .unwrap()
+                    .get_mut(&key)
+                    .expect("Registered source has no peer counterpart");
+
+                if event.source.is_readable() {
+                    peer_conn.process_read_queue();
                 }
                 if event.source.is_writable() {
-                    dbg!("Peer is writable");
-
+                    peer_conn.flush_write_queue();
                 }
             }
 
@@ -340,10 +349,67 @@ impl AnnounceResponse {
 struct PeerConnection {
     socket: TcpStream,
     addr: SocketAddr,
+    write_queue: Vec<RawMessage>,
+    read_queue: Vec<RawMessage>,
 }
 impl PeerConnection {
-    pub fn establish(addr: SocketAddr) -> anyhow::Result<Self> {
+    fn establish(addr: SocketAddr) -> anyhow::Result<Self> {
         let socket = TcpStream::connect_timeout(&addr, Duration::from_secs(1))?;
-        Ok(Self { socket, addr })
+        Ok(Self {
+            socket,
+            addr,
+            write_queue: Vec::new(),
+            read_queue: Vec::new(),
+        })
+    }
+
+    fn flush_write_queue(&mut self) -> anyhow::Result<()> {
+        let mut errors = Vec::new();
+        for message in self.write_queue.drain(..) {
+            let bytes: Vec<u8> = message.into();
+            let result = self.socket.write(&bytes);
+            if result.is_err() {
+                errors.push(result.err());
+            }
+        }
+        if errors.len() > 0 {
+            bail!("Message failed to write")
+        }
+        Ok(())
+    }
+
+    fn process_read_queue(&self) -> anyhow::Result<()> {
+        Ok(())
+    }
+}
+
+struct RawMessage {
+    message_id: u8,
+    payload: Vec<u8>,
+}
+impl From<&[u8]> for RawMessage {
+    fn from(bytes: &[u8]) -> Self {
+        if bytes.len() == 0 {
+            return Self {
+                message_id: 0,
+                payload: Vec::new(),
+            };
+        }
+        let payload_length = bytes.len() - 1 as usize;
+        let message_id = BigEndian::read_int(&bytes, 1) as u8;
+        let mut payload = vec![0u8; payload_length];
+        payload.copy_from_slice(&bytes[1..]);
+        Self {
+            message_id,
+            payload,
+        }
+    }
+}
+impl From<RawMessage> for Vec<u8> {
+    fn from(raw_message: RawMessage) -> Self {
+        let mut bytes = vec![0u8; raw_message.payload.len() + 1];
+        bytes[0] = raw_message.message_id;
+        bytes[1..].copy_from_slice(&raw_message.payload);
+        bytes
     }
 }
