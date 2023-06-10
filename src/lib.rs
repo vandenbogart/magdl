@@ -98,7 +98,6 @@ impl Magdl {
                             &con_ref.socket,
                             interest::ALL,
                         );
-
                     }
                     Err(e) => println!("Failed to connect to peer {}", e),
                 }
@@ -473,6 +472,7 @@ impl PeerConnection {
             bail!("Bad infohash")
         }
 
+        socket.set_nonblocking(true)?;
         Ok(Self {
             socket,
             addr,
@@ -497,11 +497,24 @@ impl PeerConnection {
     }
 
     fn read_to_queue(&mut self) -> anyhow::Result<()> {
-        let mut buffer = [0u8; 4092];
+        loop {
+            let mut length = vec![0u8; 4];
+            self.socket.read_exact(&mut length)?;
+            let length = BigEndian::read_int(&length, 4) as usize;
+            let mut message_bytes = vec![0u8; length];
+            match self.socket.read_exact(&mut message_bytes) {
+                Ok(_) => {
+                    self.read_queue.push(RawMessage::from(&message_bytes[..]));
+                    dbg!(&self.read_queue);
+                },
+                Err(_) => break,
+            }
+        }
         Ok(())
     }
 }
 
+#[derive(Debug)]
 struct RawMessage {
     message_id: u8,
     payload: Vec<u8>,
