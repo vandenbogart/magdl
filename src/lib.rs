@@ -6,10 +6,11 @@
 use std::{
     borrow::BorrowMut,
     collections::HashMap,
+    io::{Read, Write},
     net::{self, IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket},
     sync::{mpsc, Arc, Mutex, MutexGuard},
     thread,
-    time::Duration, io::Write,
+    time::Duration,
 };
 
 use anyhow::{bail, Context};
@@ -17,7 +18,9 @@ use byteorder::{BigEndian, ByteOrder};
 use popol::{interest, Event};
 use rand::{random, Rng};
 
-#[derive(Eq, PartialEq, Clone, Hash, Debug)]
+const BITTORRENT_PROTOCOL: &str = "BitTorrent protocol";
+
+#[derive(Eq, PartialEq, Copy, Clone, Hash, Debug)]
 enum SourceKey {
     Peer(SocketAddr),
 }
@@ -77,24 +80,29 @@ impl Magdl {
         let sources = Arc::new(Mutex::new(popol::Sources::new()));
         let events = Arc::new(Mutex::new(Vec::<Event<SourceKey>>::new()));
         let source_map = Arc::new(Mutex::new(HashMap::new()));
+        let mut peer_state = HashMap::<SourceKey, PeerState>::new();
 
         let p_sources = sources.clone();
         let p_source_map = source_map.clone();
         let peer_thread = thread::spawn(move || {
-            peer_addrs
-                .into_iter()
-                .for_each(|addr| match PeerConnection::establish(addr) {
+            peer_addrs.into_iter().for_each(|addr| {
+                match PeerConnection::establish(addr, magnet.info_hash.to_vec(), peer_id.to_vec()) {
                     Ok(conn) => {
                         let key = SourceKey::Peer(conn.addr);
+                        println!("Connected to peer {}", &conn.addr);
+                        let mut sm = p_source_map.lock().unwrap();
+                        sm.insert(key.clone(), conn);
+                        let con_ref = sm.get(&key).unwrap();
                         p_sources.lock().unwrap().register(
                             key.clone(),
-                            &conn.socket,
+                            &con_ref.socket,
                             interest::ALL,
                         );
-                        p_source_map.lock().unwrap().insert(key.clone(), conn);
+
                     }
                     Err(e) => println!("Failed to connect to peer {}", e),
-                })
+                }
+            })
         });
 
         // Main execution loop
@@ -111,27 +119,67 @@ impl Magdl {
                     sources.lock().unwrap().unregister(&key);
                     dbg!("Disconnected or errored", &key);
                 }
-
-                let peer_conn = source_map
-                    .lock()
-                    .unwrap()
+                let mut sm = source_map.lock().unwrap();
+                let peer_conn = sm
                     .get_mut(&key)
                     .expect("Registered source has no peer counterpart");
 
                 if event.source.is_readable() {
-                    peer_conn.process_read_queue();
+                    peer_conn.read_to_queue();
                 }
                 if event.source.is_writable() {
-                    peer_conn.flush_write_queue();
+                    peer_conn.flush_write_queue_to_stream();
                 }
             }
 
             // Receive messages from peers and update their state
-            // todo!();
+            {
+                let sm = source_map.lock().unwrap();
+                let mut invalidated_keys = Vec::new();
+                for (key, conn) in sm.iter() {
+                    let entry = peer_state.entry(*key).or_insert(PeerState::default());
+                    for message in conn.read_queue.iter() {
+                        match message.message_id {
+                            12 => {
+                                // Handshake
+                                let info_hash = &message.payload[0..20];
+                                let peer_id = &message.payload[20..40];
+                                if info_hash != magnet.info_hash {
+                                    println!("Mismatched info hash, discarding peer");
+                                    invalidated_keys.push(key);
+                                } else {
+                                    entry.peer_id =
+                                        Some(String::from_utf8_lossy(peer_id).to_string());
+                                    dbg!(&entry);
+                                }
+                            }
+                            _ => (),
+                        }
+                    }
+                    if invalidated_keys.len() > 0 {
+                        let mut sm = source_map.lock().unwrap();
+                        for key in invalidated_keys.iter() {
+                            sm.remove(key);
+                            peer_state.remove(key);
+                            sources.lock().unwrap().unregister(&key);
+                        }
+                    }
+                }
+            }
 
             // Request pieces from peers
             // todo!();
         }
+    }
+}
+
+#[derive(Debug)]
+struct PeerState {
+    peer_id: Option<String>,
+}
+impl Default for PeerState {
+    fn default() -> Self {
+        Self { peer_id: None }
     }
 }
 
@@ -346,6 +394,57 @@ impl AnnounceResponse {
     }
 }
 
+#[derive(Debug, PartialEq)]
+struct HandShake {
+    pub pstr: Vec<u8>,
+    pub info_hash: Vec<u8>,
+    pub peer_id: Vec<u8>,
+}
+impl HandShake {
+    fn to_bytes(&self) -> Vec<u8> {
+        let pstrlen = self.pstr.len();
+        let size = 49 + pstrlen;
+        let mut bytes = vec![0u8; size];
+        // pstrlen
+        BigEndian::write_int(&mut bytes, pstrlen as i64, 1);
+        // pstr
+        let end_pstr = pstrlen + 1;
+        bytes[1..end_pstr].copy_from_slice(&self.pstr);
+        // reserved
+        let end_reserved = end_pstr + 8;
+        let reserved = vec![0u8; 8];
+        bytes[end_pstr..end_reserved].copy_from_slice(&reserved);
+        // info hash
+        let end_info_hash = end_reserved + 20;
+        bytes[end_reserved..end_info_hash].copy_from_slice(&self.info_hash);
+        // peer id
+        let end_peer_id = end_info_hash + 20;
+        bytes[end_info_hash..end_peer_id].copy_from_slice(&self.peer_id);
+        bytes
+    }
+    fn from_bytes(bytes: &[u8]) -> Self {
+        // pstrlen
+        let pstrlen = BigEndian::read_int(bytes, 1) as usize;
+        let end_pstr = pstrlen + 1;
+        // pstr
+        let pstr = bytes[1..end_pstr].to_vec();
+        // reserved
+        let end_reserved = end_pstr + 8;
+        bytes[end_pstr..end_reserved].to_vec();
+        // info hash
+        let end_info_hash = end_reserved + 20;
+        let info_hash = bytes[end_reserved..end_info_hash].to_vec();
+        // peer id
+        let end_peer_id = end_info_hash + 20;
+        let peer_id = bytes[end_info_hash..end_peer_id].to_vec();
+        Self {
+            pstr,
+            info_hash,
+            peer_id,
+        }
+    }
+}
+
 struct PeerConnection {
     socket: TcpStream,
     addr: SocketAddr,
@@ -353,8 +452,27 @@ struct PeerConnection {
     read_queue: Vec<RawMessage>,
 }
 impl PeerConnection {
-    fn establish(addr: SocketAddr) -> anyhow::Result<Self> {
-        let socket = TcpStream::connect_timeout(&addr, Duration::from_secs(1))?;
+    fn establish(addr: SocketAddr, info_hash: Vec<u8>, peer_id: Vec<u8>) -> anyhow::Result<Self> {
+        let mut socket = TcpStream::connect_timeout(&addr, Duration::from_secs(1))?;
+        let request_handshake = HandShake {
+            pstr: BITTORRENT_PROTOCOL.as_bytes().to_vec(),
+            info_hash,
+            peer_id,
+        };
+        socket
+            .write_all(&request_handshake.to_bytes())
+            .context("Failed to write handshake")?;
+        let mut bytes = vec![0u8; request_handshake.to_bytes().len()];
+        socket
+            .read_exact(&mut bytes)
+            .context("Failed to read handshake")?;
+        let response_handshake = HandShake::from_bytes(&bytes);
+        if request_handshake.pstr != response_handshake.pstr {
+            bail!("Bad protocol")
+        } else if request_handshake.info_hash != response_handshake.info_hash {
+            bail!("Bad infohash")
+        }
+
         Ok(Self {
             socket,
             addr,
@@ -363,7 +481,7 @@ impl PeerConnection {
         })
     }
 
-    fn flush_write_queue(&mut self) -> anyhow::Result<()> {
+    fn flush_write_queue_to_stream(&mut self) -> anyhow::Result<()> {
         let mut errors = Vec::new();
         for message in self.write_queue.drain(..) {
             let bytes: Vec<u8> = message.into();
@@ -378,7 +496,8 @@ impl PeerConnection {
         Ok(())
     }
 
-    fn process_read_queue(&self) -> anyhow::Result<()> {
+    fn read_to_queue(&mut self) -> anyhow::Result<()> {
+        let mut buffer = [0u8; 4092];
         Ok(())
     }
 }
