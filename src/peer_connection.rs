@@ -1,38 +1,153 @@
-use std::{fmt::{Display, Debug}, net::SocketAddr, time::Duration};
+use std::{
+    fmt::{Debug, Display},
+    net::SocketAddr,
+};
 
 use anyhow::Context;
 use byteorder::{BigEndian, ByteOrder};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::connection::{Frame, TcpConnection};
+
+#[derive(Debug)]
+pub enum PeerMessageType {
+    Choke,
+    Unchoke,
+    Interested,
+    NotInterested,
+    Have,
+    Bitfield,
+    Request,
+    Piece,
+    Cancel,
+    Port,
+}
+impl PeerMessageType {
+    pub fn raw_value(&self) -> u8 {
+        match self {
+            PeerMessageType::Choke => 0,
+            PeerMessageType::Unchoke => 1,
+            PeerMessageType::Interested => 2,
+            PeerMessageType::NotInterested => 3,
+            PeerMessageType::Have => 4,
+            PeerMessageType::Bitfield => 5,
+            PeerMessageType::Request => 6,
+            PeerMessageType::Piece => 7,
+            PeerMessageType::Cancel => 8,
+            PeerMessageType::Port => 9,
+            _ => panic!("Invalid peer message type"),
+        }
+    }
+}
+impl From<u8> for PeerMessageType {
+    fn from(value: u8) -> Self {
+        match value {
+            0 => Self::Choke,
+            1 => Self::Unchoke,
+            2 => Self::Interested,
+            3 => Self::NotInterested,
+            4 => Self::Have,
+            5 => Self::Bitfield,
+            6 => Self::Request,
+            7 => Self::Piece,
+            8 => Self::Cancel,
+            9 => Self::Port,
+            _ => panic!("Invalid peer message type"),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct PeerMessage {
+    pub message_type: PeerMessageType,
+    pub payload: Vec<u8>,
+    pub addr: SocketAddr,
+}
 
 const BITTORRENT_PROTOCOL: &str = "BitTorrent protocol";
 pub struct PeerConnection {
     tcp_conn: TcpConnection,
+    addr: SocketAddr,
+    sender: mpsc::Sender<PeerMessage>,
+    receiver: mpsc::Receiver<PeerMessage>,
 }
 impl PeerConnection {
     pub async fn connect(
         addr: SocketAddr,
         peer_id: [u8; 20],
         info_hash: [u8; 20],
+        sender: mpsc::Sender<PeerMessage>,
+        receiver: mpsc::Receiver<PeerMessage>,
     ) -> anyhow::Result<Self> {
-
-        let conn_future = TcpConnection::establish(addr);
-        let mut conn = tokio::time::timeout(Duration::from_secs(5), conn_future).await.context("Establish Timed Out")??;
+        let mut conn = TcpConnection::establish(addr).await?;
         let handshake = Handshake {
             pstr: BITTORRENT_PROTOCOL.as_bytes().to_vec(),
             info_hash,
             peer_id,
         };
-        conn.write(&[PeerFrame::Handshake(handshake)]).await.context("Writing handshake to peer")?;
-        let frames = conn.read::<PeerFrame>().await.context("Reading handshake from peer")?;
-        for frame in frames {
-            match frame {
-                PeerFrame::Handshake(hs) => println!("{}", hs),
-                PeerFrame::Data(data) => println!("{:?}", data),
+        conn.write(&[PeerFrame::Handshake(handshake)])
+            .await
+            .context("Writing handshake to peer")?;
+        let mut frames = conn.read::<PeerFrame>().await?;
+        if let Some(PeerFrame::Handshake(hs)) = frames.next() {
+            if hs.info_hash != info_hash {
+                anyhow::bail!("Bad infohash in handshake");
             }
         }
+        while let Some(frame) = frames.next() {
+            match frame {
+                PeerFrame::Handshake(_) => anyhow::bail!("Multiple handshake responses"),
+                PeerFrame::Data(d) => {
+                    sender
+                        .send(PeerMessage {
+                            message_type: PeerMessageType::from(d.message_id),
+                            payload: d.payload,
+                            addr,
+                        })
+                        .await?
+                }
+            };
+        }
 
-        Ok(Self { tcp_conn: conn })
+        Ok(Self {
+            tcp_conn: conn,
+            addr,
+            sender,
+            receiver,
+        })
+    }
+    pub async fn handle_messages(&mut self) -> anyhow::Result<()> {
+        loop {
+            let frames = self.tcp_conn.try_read::<PeerFrame>().await?;
+            for frame in frames {
+                match frame {
+                    PeerFrame::Handshake(_) => anyhow::bail!("Multiple handshake responses"),
+                    PeerFrame::Data(d) => {
+                        self.sender
+                            .send(PeerMessage {
+                                message_type: PeerMessageType::from(d.message_id),
+                                payload: d.payload,
+                                addr: self.addr,
+                            })
+                            .await?
+                    }
+                };
+            }
+            match self.receiver.try_recv() {
+                Ok(message) => {
+                    let frame = PeerFrame::Data(Data {
+                        message_id: message.message_type.raw_value(),
+                        payload: message.payload,
+                    });
+                    self.tcp_conn.write(&[frame]).await?;
+                    println!("Sent message");
+                }
+                Err(mpsc::error::TryRecvError::Empty) => continue,
+                Err(mpsc::error::TryRecvError::Disconnected) => {
+                    anyhow::bail!("oneshot channel closed")
+                }
+            };
+        }
     }
 }
 
@@ -88,7 +203,6 @@ impl Handshake {
         let end_res = 9 + pstrlen;
         bytes[end_res..20 + end_res].copy_from_slice(&self.info_hash);
         bytes[20 + end_res..40 + end_res].copy_from_slice(&self.peer_id);
-        println!("{}", &self);
         bytes.to_vec()
     }
 }
@@ -148,7 +262,7 @@ impl Data {
 }
 
 #[derive(Debug)]
-enum PeerFrame {
+pub enum PeerFrame {
     Handshake(Handshake),
     Data(Data),
 }

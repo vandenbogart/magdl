@@ -1,4 +1,4 @@
-use std::net::SocketAddr;
+use std::{net::SocketAddr, io};
 
 use anyhow::Context;
 use tokio::{
@@ -34,13 +34,36 @@ impl TcpConnection {
                 anyhow::bail!("Connection reset by peer");
             }
             Ok(n) => {
-                println!("Read {} bytes", n);
-
                 self.r_cur += n;
                 if self.r_cur == self.read_buf.len() {
                     self.read_buf.resize(self.read_buf.len() * 2, 0u8);
                 }
             }
+            Err(e) => anyhow::bail!(e),
+        }
+
+        let mut frames = Vec::new();
+        while let Some((frame, len)) = T::from_bytes(&self.read_buf[..self.r_cur]) {
+            let (_, remain) = self.read_buf.split_at(len);
+            self.r_cur -= len;
+            self.read_buf = remain.to_vec();
+            frames.push(frame);
+        }
+        Ok(frames.into_iter())
+    }
+    pub async fn try_read<T: Frame + Sized>(&mut self) -> anyhow::Result<impl Iterator<Item = T>> {
+        self.tcp_stream.readable().await?;
+        match self.tcp_stream.try_read(&mut self.read_buf) {
+            Ok(0) => {
+                anyhow::bail!("Connection reset by peer");
+            }
+            Ok(n) => {
+                self.r_cur += n;
+                if self.r_cur == self.read_buf.len() {
+                    self.read_buf.resize(self.read_buf.len() * 2, 0u8);
+                }
+            }
+            Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => (),
             Err(e) => anyhow::bail!(e),
         }
 
