@@ -28,7 +28,7 @@ impl TcpConnection {
             read_buf: vec![0u8; 4096],
         })
     }
-    pub async fn read<T: Frame + Sized>(&mut self) -> anyhow::Result<impl Iterator<Item = T>> {
+    pub async fn read<T: Frame + Sized>(&mut self) -> anyhow::Result<Vec<T>> {
         match self.tcp_stream.read(&mut self.read_buf).await {
             Ok(0) => {
                 anyhow::bail!("Connection reset by peer");
@@ -49,9 +49,9 @@ impl TcpConnection {
             self.read_buf = remain.to_vec();
             frames.push(frame);
         }
-        Ok(frames.into_iter())
+        Ok(frames)
     }
-    pub async fn try_read<T: Frame + Sized>(&mut self) -> anyhow::Result<impl Iterator<Item = T>> {
+    pub async fn try_read<T: Frame + Sized>(&mut self) -> anyhow::Result<Vec<T>> {
         self.tcp_stream.readable().await?;
         match self.tcp_stream.try_read(&mut self.read_buf) {
             Ok(0) => {
@@ -74,7 +74,7 @@ impl TcpConnection {
             self.read_buf = remain.to_vec();
             frames.push(frame);
         }
-        Ok(frames.into_iter())
+        Ok(frames)
     }
     pub async fn write<T: Frame + Sized>(&mut self, frames: &[T]) -> anyhow::Result<()> {
         let bytes: Vec<u8> = frames.iter().flat_map(|f| f.to_bytes()).collect();

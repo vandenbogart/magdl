@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::connection::{Frame, TcpConnection};
 
-#[derive(Debug)]
+#[derive(Debug, Eq, PartialEq)]
 pub enum PeerMessageType {
     Choke,
     Unchoke,
@@ -88,7 +88,7 @@ impl PeerConnection {
         conn.write(&[PeerFrame::Handshake(handshake)])
             .await
             .context("Writing handshake to peer")?;
-        let mut frames = conn.read::<PeerFrame>().await?;
+        let mut frames = conn.read::<PeerFrame>().await?.into_iter();
         if let Some(PeerFrame::Handshake(hs)) = frames.next() {
             if hs.info_hash != info_hash {
                 anyhow::bail!("Bad infohash in handshake");
@@ -105,7 +105,8 @@ impl PeerConnection {
                             addr,
                         })
                         .await?
-                }
+                },
+                PeerFrame::Disconnected => todo!(),
             };
         }
 
@@ -118,29 +119,53 @@ impl PeerConnection {
     }
     pub async fn handle_messages(&mut self) -> anyhow::Result<()> {
         loop {
-            let frames = self.tcp_conn.try_read::<PeerFrame>().await?;
-            for frame in frames {
+            println!("try read: {}", self.addr);
+            let frames = match self.tcp_conn.try_read::<PeerFrame>().await {
+                Ok(frames) => frames,
+                Err(_) => {
+                    let frames = vec![PeerFrame::Disconnected];
+                    frames
+                },
+            };
+            for frame in frames.into_iter() {
                 match frame {
                     PeerFrame::Handshake(_) => anyhow::bail!("Multiple handshake responses"),
                     PeerFrame::Data(d) => {
+                        println!("try forward: {}", self.addr);
                         self.sender
                             .send(PeerMessage {
                                 message_type: PeerMessageType::from(d.message_id),
                                 payload: d.payload,
                                 addr: self.addr,
                             })
-                            .await?
-                    }
+                            .await?;
+                        println!("done forward: {}", self.addr);
+                    },
+                    PeerFrame::Disconnected => {
+                        self.sender
+                            .send(PeerMessage {
+                                message_type: PeerMessageType::Cancel,
+                                payload: Vec::new(),
+                                addr: self.addr,
+                            })
+                            .await?;
+                        anyhow::bail!("disconnected");
+                    },
                 };
             }
+
+            println!("done read: {}", self.addr);
+            println!("try receive: {}", self.addr);
             match self.receiver.try_recv() {
                 Ok(message) => {
+                    println!("done receive: {}", self.addr);
                     let frame = PeerFrame::Data(Data {
                         message_id: message.message_type.raw_value(),
                         payload: message.payload,
                     });
+                    println!("try send: {}", self.addr);
                     self.tcp_conn.write(&[frame]).await?;
-                    println!("Sent message");
+                    println!("done send: {}", self.addr);
                 }
                 Err(mpsc::error::TryRecvError::Empty) => continue,
                 Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -152,7 +177,7 @@ impl PeerConnection {
 }
 
 #[derive(Debug)]
-struct Handshake {
+pub struct Handshake {
     pstr: Vec<u8>,
     info_hash: [u8; 20],
     peer_id: [u8; 20],
@@ -208,7 +233,7 @@ impl Handshake {
 }
 
 #[derive(Debug)]
-struct Data {
+pub struct Data {
     message_id: u8,
     payload: Vec<u8>,
 }
@@ -265,6 +290,7 @@ impl Data {
 pub enum PeerFrame {
     Handshake(Handshake),
     Data(Data),
+    Disconnected,
 }
 
 impl Frame for PeerFrame {
@@ -285,6 +311,7 @@ impl Frame for PeerFrame {
         match self {
             PeerFrame::Handshake(v) => v.to_bytes(),
             PeerFrame::Data(v) => v.to_bytes(),
+            PeerFrame::Disconnected => todo!(),
         }
     }
 }
