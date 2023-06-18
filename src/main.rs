@@ -3,9 +3,9 @@ mod peer_codec;
 mod peer_message;
 mod tracker_stream;
 use byteorder::{BigEndian, ByteOrder};
-use bytes::Bytes;
-use futures::{SinkExt, StreamExt};
-use peer_codec::{Handshake, PeerCodec, PeerFrame, BITTORRENT_PROTOCOL};
+use bytes::{Bytes, BytesMut};
+use futures::{SinkExt, StreamExt, stream::SplitStream};
+use peer_codec::{Handshake, PeerCodec, PeerFrame, BITTORRENT_PROTOCOL, Data};
 use peer_message::{PeerMessage, PeerMessageType};
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use tokio_util::codec::Framed;
@@ -61,7 +61,8 @@ async fn main() -> anyhow::Result<()> {
 async fn peer_process(state: Arc<RwLock<Shared>>, addr: SocketAddr) -> anyhow::Result<()> {
     let conn_future = TcpStream::connect(addr);
     let conn = tokio::time::timeout(Duration::from_secs(5), conn_future).await??;
-    let mut framed = Framed::new(conn, PeerCodec::new());
+    let framed = Framed::new(conn, PeerCodec::new());
+    let (mut sink, mut stream) = framed.split();
 
     let info_hash = {
         let state = state.read().await;
@@ -71,10 +72,10 @@ async fn peer_process(state: Arc<RwLock<Shared>>, addr: SocketAddr) -> anyhow::R
             peer_id: state.peer_id.clone(),
         };
         let hs_frame = PeerFrame::Handshake(handshake);
-        framed.send(hs_frame).await?;
+        sink.send(hs_frame).await?;
         state.info_hash.clone()
     };
-    let process_peer_id = match framed.next().await {
+    let process_peer_id = match stream.next().await {
         Some(Ok(PeerFrame::Handshake(hs))) => {
             if hs.info_hash != info_hash {
                 anyhow::bail!("Bad info hash");
@@ -91,9 +92,25 @@ async fn peer_process(state: Arc<RwLock<Shared>>, addr: SocketAddr) -> anyhow::R
             anyhow::bail!("Connection reset by peer");
         }
     };
-    let mut peer = Peer::new(process_peer_id, state.clone(), framed).await?;
+    let (tx, rx) = mpsc::unbounded_channel::<PeerMessage>();
+    let mut peer = Peer::new(process_peer_id, state.clone(), stream, addr, tx).await?;
 
-    while let Some(frame) = peer.framed.next().await {
+    tokio::spawn(async move {
+        let mut rx = rx;
+        let mut sink = sink;
+
+        while let Some(message) = rx.recv().await {
+            let frame = PeerFrame::Data(Data {
+                message_id: message.message_type.raw_value(),
+                payload: message.payload,
+            });
+            if let Err(e) = sink.send(frame).await {
+                dbg!(e);
+            };
+        }
+    });
+
+    while let Some(frame) = peer.stream.next().await {
         match frame {
             Ok(PeerFrame::Data(data)) => {
                 let message = PeerMessage {
@@ -116,12 +133,50 @@ async fn peer_process(state: Arc<RwLock<Shared>>, addr: SocketAddr) -> anyhow::R
     Ok(())
 }
 
+enum PieceStatus {
+    NotStarted,
+    RequestingBlock,
+    Inactive,
+    Complete,
+}
+struct Piece {
+    index: usize,
+    status: PieceStatus,
+    current_offset: usize,
+    data: BytesMut,
+}
+impl Piece {
+    fn new(index: usize) -> Self {
+        Self {
+            index,
+            status: PieceStatus::NotStarted,
+            current_offset: 0,
+            data: BytesMut::new(),
+        }
+    }
+}
+
 struct PeerState {
     choked: bool,
     interested: bool,
     am_choked: bool,
     am_interested: bool,
     bitfield: Vec<bool>,
+    piece_queue: Vec<Piece>,
+}
+impl PeerState {
+    async fn request_pieces(&mut self, tx: &UnboundedSender<PeerMessage>) -> anyhow::Result<()> {
+        todo!();
+
+    }
+    fn process_piece_message(&mut self, message: PeerMessage) {
+        todo!();
+
+    }
+    async fn express_interest(&mut self, tx: &UnboundedSender<PeerMessage>) -> anyhow::Result<()> {
+        todo!();
+
+    }
 }
 impl Default for PeerState {
     fn default() -> Self {
@@ -131,6 +186,7 @@ impl Default for PeerState {
             am_choked: true,
             am_interested: false,
             bitfield: Vec::new(),
+            piece_queue: Vec::new(),
         }
     }
 }
@@ -138,19 +194,17 @@ impl Default for PeerState {
 pub struct Peer {
     shared: Arc<RwLock<Shared>>,
     process_peer_id: Bytes,
-    framed: Framed<TcpStream, PeerCodec>,
-    rx: UnboundedReceiver<PeerMessage>,
+    stream: SplitStream<Framed<TcpStream, PeerCodec>>,
     addr: SocketAddr,
 }
 impl Peer {
     async fn new(
         process_peer_id: Bytes,
         shared: Arc<RwLock<Shared>>,
-        framed: Framed<TcpStream, PeerCodec>,
+        stream: SplitStream<Framed<TcpStream, PeerCodec>>,
+        addr: SocketAddr,
+        tx: UnboundedSender<PeerMessage>
     ) -> anyhow::Result<Self> {
-        let addr = framed.get_ref().peer_addr()?;
-        let (tx, rx) = mpsc::unbounded_channel::<PeerMessage>();
-
         {
             let mut state = shared.write().await;
             state.peer_channels.insert(addr, tx);
@@ -160,16 +214,14 @@ impl Peer {
         Ok(Self {
             shared,
             process_peer_id,
-            framed,
-            rx,
+            stream,
             addr,
         })
     }
     async fn cleanup(&mut self) -> anyhow::Result<()> {
-        let addr = self.framed.get_ref().peer_addr()?;
         let mut state = self.shared.write().await;
-        state.peer_channels.remove(&addr);
-        state.peer_state.remove(&addr);
+        state.peer_channels.remove(&self.addr);
+        state.peer_state.remove(&self.addr);
         Ok(())
     }
     async fn handle_message(&mut self, message: PeerMessage) {
