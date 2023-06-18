@@ -2,6 +2,7 @@ use std::{net::{IpAddr, Ipv4Addr, SocketAddr, ToSocketAddrs}, time::Duration, co
 
 use anyhow::Context;
 use byteorder::{BigEndian, ByteOrder};
+use bytes::Bytes;
 use futures::{stream::FuturesUnordered, StreamExt};
 use tokio::net::UdpSocket;
 use url::Url;
@@ -32,13 +33,13 @@ impl Trackers {
         Self { connections: conns }
     }
 
-    pub async fn announce(&self, peer_id: [u8; 20], info_hash: [u8; 20]) -> Vec<SocketAddr> {
+    pub async fn announce(&self, peer_id: Bytes, info_hash: Bytes) -> Vec<SocketAddr> {
         let futures = FuturesUnordered::new();
         for conn in self.connections.iter() {
             futures.push(conn.announce(AnnounceRequestDescriptor {
                 connection_id: conn.connection_id,
-                peer_id,
-                info_hash,
+                peer_id: peer_id.clone(),
+                info_hash: info_hash.clone(),
                 downloaded: 0,
                 left: 0,
                 uploaded: 0,
@@ -209,8 +210,8 @@ struct AnnounceRequest {
     connection_id: i64,
     action: u32,
     transaction_id: u32,
-    info_hash: [u8; 20],
-    peer_id: [u8; 20],
+    info_hash: Bytes,
+    peer_id: Bytes,
     downloaded: u64,
     left: u64,
     uploaded: u64,
@@ -224,8 +225,8 @@ struct AnnounceRequest {
 #[derive(Debug)]
 pub struct AnnounceRequestDescriptor {
     pub connection_id: i64,
-    pub peer_id: [u8; 20],
-    pub info_hash: [u8; 20],
+    pub peer_id: Bytes,
+    pub info_hash: Bytes,
     pub downloaded: u64,
     pub left: u64,
     pub uploaded: u64,

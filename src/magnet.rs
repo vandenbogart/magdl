@@ -4,7 +4,7 @@ pub struct Magnet {
     pub display_name: String,
 }
 impl Magnet {
-    pub fn from_link_string(value: String) -> Self {
+    pub fn from_link_string(value: &str) -> Self {
         let decoded = urlencoding::decode(&value).expect("Failed to parse magnet link");
         let slice = &decoded[8..];
         let split = slice.split("&").collect::<Vec<_>>();
